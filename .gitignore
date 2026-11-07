@@ -1,0 +1,24 @@
+# Служебные файлы установщика
+install.lock
+install.key
+install.log
+.installer/
+composer.phar
+
+# Установленные проекты и зависимости
+/vendor/
+/node_modules/
+*.phar
+
+# Временные и системные файлы
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
