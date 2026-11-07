@@ -11,7 +11,7 @@ declare(strict_types=1);
  * Author: Mikhail Gubin
  */
 
-const INSTALLER_VERSION = '1.0.0';
+const INSTALLER_VERSION = '1.1.0';
 const USER_AGENT = 'PHP-Framework-Installer/1.0';
 const PACKAGIST_P2 = 'https://repo.packagist.org/p2/%s.json';
 const COMPOSER_INSTALLER_URL = 'https://getcomposer.org/installer';
@@ -102,11 +102,6 @@ function cacheDir(): string
     $dir = toolsDir() . '/cache';
     ensureDir($dir);
     return $dir;
-}
-
-function keyFile(): string
-{
-    return envValue('INSTALL_KEY_FILE', toolsDir() . '/install.key') ?? (toolsDir() . '/install.key');
 }
 
 function logFile(): string
@@ -442,28 +437,26 @@ function requestIp(): string
     return $ip !== '' ? $ip : 'unknown';
 }
 
-function ensureKey(): string
+/**
+ * Без пароля веб-интерфейс открыт только для локальных адресов.
+ * INSTALL_WEB_ALLOW_REMOTE=1 снимает ограничение (например, для доступа из интернета).
+ */
+function webAccessAllowed(): bool
 {
-    $configured = envValue('INSTALL_KEY');
-    if ($configured !== null) {
-        return $configured;
+    if (envFlag('INSTALL_WEB_ALLOW_REMOTE', false)) {
+        return true;
     }
 
-    $file = keyFile();
-    if (is_file($file)) {
-        $key = trim((string) @file_get_contents($file));
-        if ($key !== '') {
-            return $key;
-        }
+    $ip = requestIp();
+    if ($ip === 'unknown' || filter_var($ip, FILTER_VALIDATE_IP) === false) {
+        return true;
     }
 
-    $key = bin2hex(random_bytes(24));
-    if (!writeFileAtomic($file, $key . PHP_EOL, 0600)) {
-        throw new InstallerException(
-            'Не удалось создать файл ключа. Задайте ключ через переменную окружения INSTALL_KEY.'
-        );
-    }
-    return $key;
+    return filter_var(
+        $ip,
+        FILTER_VALIDATE_IP,
+        FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+    ) === false;
 }
 
 function isTty(): bool
@@ -2810,7 +2803,6 @@ function environmentInfo(): array
         'allow_url_fopen' => filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN),
         'shell_exec' => function_exists('shell_exec'),
         'composer' => composerInfo(false),
-        'key_file' => keyFile(),
         'cache_dir' => cacheDir(),
         'log_file' => logFile(),
         'install_lock' => is_file(lockFile()),
@@ -2928,11 +2920,13 @@ function environmentChecks(): array
     );
 
     $add(
-        'key',
-        'Ключ доступа',
-        (is_file(keyFile()) || envValue('INSTALL_KEY') !== null) ? 'ok' : 'warn',
-        keyFile(),
-        'Ключ создаётся автоматически при первом открытии веб-интерфейса.'
+        'web_access',
+        'Доступ к веб-интерфейсу',
+        envFlag('INSTALL_WEB_ALLOW_REMOTE', false) ? 'warn' : 'ok',
+        envFlag('INSTALL_WEB_ALLOW_REMOTE', false)
+            ? 'разрешён с любых адресов'
+            : 'только localhost и локальная сеть',
+        'Пароль не требуется. Для доступа из интернета задайте INSTALL_WEB_ALLOW_REMOTE=1 и закройте установщик после настройки.'
     );
 
     return ['info' => $info, 'checks' => $checks];
@@ -2993,7 +2987,6 @@ function cliUsage(): int
         '  php install.php install <пакет> [опции]      установить фреймворк',
         '  php install.php composer                     установить/проверить Composer',
         '  php install.php doctor [--json]              диагностика окружения',
-        '  php install.php key                          показать ключ веб-доступа',
         '  php install.php cache:clear                  очистить кэш',
         '  php install.php --version                    версия установщика',
         '',
@@ -3016,8 +3009,9 @@ function cliUsage(): int
         '  php install.php install symfony/skeleton --version=8.1.99',
         '  php install.php detect .',
         '',
-        'Веб-режим: откройте install.php в браузере и введите ключ из файла,',
-        'путь к которому показан на странице входа.',
+        'Веб-режим: откройте install.php в браузере — пароль не требуется.',
+        'Доступ по умолчанию открыт только для localhost и локальной сети.',
+        'После настройки создайте install.lock, чтобы отключить веб-интерфейс.',
         '',
         'Разработал: Михаил Губин',
     ];
@@ -3269,14 +3263,6 @@ function cliHttp(array $positional, array $options): int
     return 0;
 }
 
-function cliKey(array $options): int
-{
-    $key = ensureKey();
-    echo $key . PHP_EOL;
-    echo 'Файл: ' . keyFile() . PHP_EOL;
-    return 0;
-}
-
 function cliCacheClear(array $options): int
 {
     $count = clearCache();
@@ -3371,7 +3357,6 @@ function cliMain(array $argv): int
             'composer' => cliComposer($options),
             'doctor', 'check' => cliDoctor($options),
             'http' => cliHttp($positional, $options),
-            'key' => cliKey($options),
             'cache:clear', 'cache-clear' => cliCacheClear($options),
             'help', '--help', '-h' => cliUsage(),
             default => throw new InstallerException('Неизвестная команда: ' . $command),
@@ -3447,38 +3432,6 @@ function startSession(): void
     }
 }
 
-function logoutSession(): void
-{
-    $_SESSION = [];
-    if (ini_get('session.use_cookies')) {
-        $params = session_get_cookie_params();
-        setcookie(
-            session_name(),
-            '',
-            time() - 42000,
-            $params['path'],
-            $params['domain'],
-            (bool) $params['secure'],
-            (bool) $params['httponly']
-        );
-    }
-    @session_destroy();
-}
-
-function isAuthenticated(): bool
-{
-    if (($_SESSION['auth'] ?? false) !== true) {
-        return false;
-    }
-    $lastActivity = (int) ($_SESSION['last_activity'] ?? 0);
-    if ($lastActivity > 0 && time() - $lastActivity > 7200) {
-        logoutSession();
-        return false;
-    }
-    $_SESSION['last_activity'] = time();
-    return true;
-}
-
 function csrfToken(): string
 {
     if (empty($_SESSION['csrf']) || !is_string($_SESSION['csrf'])) {
@@ -3495,113 +3448,6 @@ function verifyCsrf(?string $token = null): void
     if ($token === '' || !hash_equals(csrfToken(), $token)) {
         throw new InstallerException('CSRF-токен недействителен. Обновите страницу.', 403);
     }
-}
-
-function redirectSelf(): void
-{
-    $path = strtok((string) ($_SERVER['REQUEST_URI'] ?? ''), '?');
-    if (!is_string($path) || $path === '') {
-        $path = (string) ($_SERVER['SCRIPT_NAME'] ?? 'install.php');
-    }
-    $path = str_replace(["\r", "\n"], '', $path);
-    header('Location: ' . $path);
-    exit;
-}
-
-function loginAttemptsFile(string $ip): string
-{
-    return toolsDir() . '/login-' . hash('sha256', $ip) . '.json';
-}
-
-/**
- * @return array{blocked:bool,retry:int}
- */
-function loginRateLimit(string $ip): array
-{
-    $file = loginAttemptsFile($ip);
-    $data = readJsonFile($file, 100000) ?? ['attempts' => []];
-    $now = time();
-    $attempts = array_values(array_filter(
-        is_array($data['attempts'] ?? null) ? $data['attempts'] : [],
-        static fn (mixed $timestamp): bool => is_int($timestamp) && $now - $timestamp < 600
-    ));
-
-    if (count($attempts) >= 5) {
-        return ['blocked' => true, 'retry' => max(1, 600 - ($now - min($attempts)))];
-    }
-    return ['blocked' => false, 'retry' => 0];
-}
-
-function recordLoginFailure(string $ip): void
-{
-    $file = loginAttemptsFile($ip);
-    $data = readJsonFile($file, 100000) ?? ['attempts' => []];
-    $now = time();
-    $attempts = array_values(array_filter(
-        is_array($data['attempts'] ?? null) ? $data['attempts'] : [],
-        static fn (mixed $timestamp): bool => is_int($timestamp) && $now - $timestamp < 600
-    ));
-    $attempts[] = $now;
-    writeFileAtomic($file, jsonEncode(['attempts' => $attempts]), 0600);
-}
-
-function resetLoginFailures(string $ip): void
-{
-    $file = loginAttemptsFile($ip);
-    if (is_file($file)) {
-        @unlink($file);
-    }
-}
-
-function handleLogin(): void
-{
-    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
-        renderLogin();
-        return;
-    }
-
-    try {
-        verifyCsrf((string) ($_POST['csrf'] ?? ''));
-    } catch (InstallerException $e) {
-        renderLogin($e->getMessage());
-        return;
-    }
-
-    $ip = requestIp();
-    $limit = loginRateLimit($ip);
-    if ($limit['blocked']) {
-        http_response_code(429);
-        renderLogin('Слишком много попыток входа. Повторите через ' . $limit['retry'] . ' с.');
-        return;
-    }
-
-    try {
-        $expected = ensureKey();
-    } catch (Throwable $e) {
-        renderLogin('', $e->getMessage());
-        return;
-    }
-
-    $provided = (string) ($_POST['key'] ?? '');
-    if ($provided === '' || !hash_equals($expected, $provided)) {
-        recordLoginFailure($ip);
-        usleep(400000);
-        renderLogin('Неверный ключ доступа.');
-        return;
-    }
-
-    resetLoginFailures($ip);
-    session_regenerate_id(true);
-    $_SESSION['auth'] = true;
-    $_SESSION['last_activity'] = time();
-    $_SESSION['csrf'] = bin2hex(random_bytes(32));
-    redirectSelf();
-}
-
-function handleLogout(): void
-{
-    logoutSession();
-    redirectSelf();
 }
 
 function startNdjson(): void
@@ -3838,86 +3684,6 @@ function apiComposer(): void
 // Web interface
 // ============================================================================
 
-function renderLogin(string $error = '', string $keyError = ''): void
-{
-    $nonce = cspNonce();
-    securityHeaders($nonce);
-    $keyPath = keyFile();
-    $keyFromEnv = envValue('INSTALL_KEY') !== null;
-    ?><!doctype html>
-<html lang="ru">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="robots" content="noindex, nofollow">
-    <title>Вход — PHP Framework Installer</title>
-    <style nonce="<?= e($nonce) ?>">
-        :root{--bg:#070b14;--panel:#101a2e;--line:#253656;--text:#e8eefc;--muted:#94a3b8;--accent:#38bdf8;--accent2:#818cf8;--red:#f87171;--shadow:0 20px 60px rgba(0,0,0,.35)}
-        *{box-sizing:border-box}
-        html,body{margin:0;padding:0}
-        body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:radial-gradient(1200px 600px at 10% -10%,#12305a 0,transparent 60%),radial-gradient(900px 500px at 110% 10%,#2a1b5e 0,transparent 55%),var(--bg);color:var(--text);min-height:100vh}
-        code{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:.86em}
-        .login-body{display:grid;place-items:center;min-height:100vh;padding:24px}
-        .login-card{width:min(440px,100%);background:linear-gradient(180deg,var(--panel),#0b1425);border:1px solid var(--line);border-radius:18px;padding:28px;box-shadow:var(--shadow)}
-        .login-brand{display:flex;gap:14px;align-items:center;margin-bottom:22px}
-        .logo{width:46px;height:46px;border-radius:13px;display:grid;place-items:center;font-weight:800;letter-spacing:.5px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04101f;box-shadow:0 8px 24px rgba(56,189,248,.35);flex:0 0 auto}
-        .login-brand h1{font-size:20px;margin:0;line-height:1.2}
-        .login-brand p{margin:4px 0 0;color:var(--muted);font-size:12px}
-        .login-card label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}
-        .login-card input{width:100%;background:#0a1324;border:1px solid var(--line);color:var(--text);padding:12px 14px;border-radius:10px;font:inherit;outline:none}
-        .login-card input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(56,189,248,.15)}
-        .login-card button{width:100%;margin-top:14px;appearance:none;border:none;border-radius:10px;padding:12px 14px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04101f;font:inherit;font-weight:700;cursor:pointer}
-        .login-card button:hover{filter:brightness(1.08)}
-        .login-card .hint{font-size:12px;color:var(--muted);line-height:1.5;margin:16px 0 0}
-        .login-card .hint code{display:inline-block;margin-top:4px;color:#bae6fd;word-break:break-all}
-        .login-card footer{margin-top:22px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:11px;text-align:center}
-        .alert{border-radius:10px;padding:10px 12px;font-size:13px;margin-bottom:14px;line-height:1.4}
-        .alert.error{color:#fecaca;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3)}
-    </style>
-</head>
-<body class="login-body">
-<main class="login-card">
-    <div class="login-brand">
-        <span class="logo">PI</span>
-        <div>
-            <h1>PHP Framework Installer</h1>
-            <p>Установка и проверка версий PHP-фреймворков</p>
-        </div>
-    </div>
-
-    <?php if ($error !== ''): ?>
-        <div class="alert error"><?= e($error) ?></div>
-    <?php endif; ?>
-    <?php if ($keyError !== ''): ?>
-        <div class="alert error"><?= e($keyError) ?></div>
-    <?php endif; ?>
-
-    <form method="post" action="?action=login" autocomplete="off">
-        <input type="hidden" name="csrf" value="<?= e(csrfToken()) ?>">
-        <label for="key">Ключ доступа</label>
-        <input id="key" name="key" type="password" required autofocus autocomplete="current-password" placeholder="Введите ключ">
-        <button type="submit">Войти</button>
-    </form>
-
-    <p class="hint">
-        <?php if ($keyFromEnv): ?>
-            Ключ задан через переменную окружения <code>INSTALL_KEY</code>.
-        <?php else: ?>
-            Ключ создан автоматически и хранится в файле:<br>
-            <code><?= e($keyPath) ?></code>
-        <?php endif; ?>
-    </p>
-    <p class="hint">
-        Если файл недоступен, задайте переменную окружения <code>INSTALL_KEY</code>
-        или укажите путь через <code>INSTALL_KEY_FILE</code>.
-    </p>
-
-    <footer>PHP Framework Installer <?= e(INSTALLER_VERSION) ?> · Михаил Губин</footer>
-</main>
-</body>
-</html><?php
-}
-
 function renderBlocked(): void
 {
     $nonce = cspNonce();
@@ -3930,12 +3696,12 @@ function renderBlocked(): void
     <meta name="robots" content="noindex, nofollow">
     <title>Веб-установщик заблокирован</title>
     <style nonce="<?= e($nonce) ?>">
-        body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#070b14;color:#e8eefc;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px}
-        main{max-width:560px;background:#101a2e;border:1px solid #253656;border-radius:16px;padding:28px;line-height:1.55}
-        h1{margin:0 0 12px;font-size:22px}
-        p{color:#94a3b8;margin:0 0 12px}
-        code{color:#bae6fd;word-break:break-all}
-        footer{margin-top:20px;padding-top:14px;border-top:1px solid #253656;color:#94a3b8;font-size:12px}
+        body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:linear-gradient(180deg,#eef5ff,#e3eeff);color:#12233d;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px}
+        main{max-width:560px;background:#fff;border:1px solid #d5e3f8;border-radius:18px;padding:28px;line-height:1.55;box-shadow:0 16px 40px rgba(37,99,235,.12)}
+        h1{margin:0 0 12px;font-size:22px;color:#1e3a8a}
+        p{color:#5a7092;margin:0 0 12px}
+        code{color:#1d4ed8;background:#f1f6ff;border-radius:6px;padding:1px 6px;word-break:break-all}
+        footer{margin-top:20px;padding-top:14px;border-top:1px solid #d5e3f8;color:#5a7092;font-size:12px}
     </style>
 </head>
 <body>
@@ -3949,6 +3715,44 @@ function renderBlocked(): void
 </body>
 </html><?php
 }
+
+/**
+ * Страница для случаев, когда установщик открыт с внешнего адреса
+ * при выключенном INSTALL_WEB_ALLOW_REMOTE.
+ */
+function renderRemoteBlocked(): void
+{
+    $nonce = cspNonce();
+    securityHeaders($nonce);
+    ?><!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Доступ к установщику ограничен</title>
+    <style nonce="<?= e($nonce) ?>">
+        body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:linear-gradient(180deg,#eef5ff,#e3eeff);color:#12233d;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px}
+        main{max-width:600px;background:#fff;border:1px solid #d5e3f8;border-radius:18px;padding:28px;line-height:1.55;box-shadow:0 16px 40px rgba(37,99,235,.12)}
+        h1{margin:0 0 12px;font-size:22px;color:#1e3a8a}
+        p{color:#5a7092;margin:0 0 12px}
+        code{color:#1d4ed8;background:#f1f6ff;border-radius:6px;padding:1px 6px;word-break:break-all}
+        footer{margin-top:20px;padding-top:14px;border-top:1px solid #d5e3f8;color:#5a7092;font-size:12px}
+    </style>
+</head>
+<body>
+<main>
+    <h1>Доступ к установщику ограничен</h1>
+    <p>Страница открыта без пароля, поэтому по умолчанию доступна только с локальных адресов. Ваш адрес: <code><?= e(requestIp()) ?></code>.</p>
+    <p>Откройте установщик с этой же машины (<code>http://127.0.0.1</code>) или разрешите удалённый доступ:</p>
+    <p><code>INSTALL_WEB_ALLOW_REMOTE=1</code></p>
+    <p>Не оставляйте установщик открытым в интернете дольше, чем нужно.</p>
+    <footer>PHP Framework Installer <?= e(INSTALLER_VERSION) ?> · Михаил Губин</footer>
+</main>
+</body>
+</html><?php
+}
+
 
 function renderApp(): void
 {
@@ -3986,38 +3790,38 @@ function renderApp(): void
     <meta name="robots" content="noindex, nofollow">
     <title>PHP Framework Installer</title>
     <style nonce="<?= e($nonce) ?>">
-        :root{--bg:#070b14;--bg2:#0d1526;--panel:#101a2e;--card:#14203a;--card2:#182746;--line:#253656;--text:#e8eefc;--muted:#94a3b8;--accent:#38bdf8;--accent2:#818cf8;--green:#34d399;--yellow:#fbbf24;--red:#f87171;--radius:14px;--shadow:0 20px 60px rgba(0,0,0,.35)}
+        :root{--bg:#e9f2ff;--bg2:#f5f9ff;--panel:#ffffff;--card:#ffffff;--card2:#f4f8ff;--line:#d5e3f8;--text:#12233d;--muted:#5a7092;--accent:#2563eb;--accent2:#3b82f6;--green:#0f9d58;--yellow:#b45309;--red:#dc2626;--radius:14px;--shadow:0 12px 32px rgba(37,99,235,.10)}
         *{box-sizing:border-box}
         html,body{margin:0;padding:0}
-        body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:radial-gradient(1200px 600px at 10% -10%,#12305a 0,transparent 60%),radial-gradient(900px 500px at 110% 10%,#2a1b5e 0,transparent 55%),var(--bg);color:var(--text);min-height:100vh}
+        body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:radial-gradient(900px 480px at 8% -10%,#d9e8ff 0,transparent 62%),radial-gradient(700px 420px at 105% 0,#e6eeff 0,transparent 58%),var(--bg);color:var(--text);min-height:100vh}
         a{color:var(--accent)}
         code{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:.86em}
-        .topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;padding:14px 22px;background:rgba(7,11,20,.82);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+        .topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;padding:14px 22px;background:rgba(255,255,255,.88);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
         .brand{display:flex;align-items:center;gap:12px;min-width:0}
-        .logo{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-weight:800;letter-spacing:.5px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04101f;box-shadow:0 8px 24px rgba(56,189,248,.35);flex:0 0 auto}
+        .logo{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-weight:800;letter-spacing:.5px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 8px 20px rgba(37,99,235,.28);flex:0 0 auto}
         .brand h1{font-size:17px;margin:0;line-height:1.2}
         .brand p{margin:2px 0 0;color:var(--muted);font-size:12px}
         .env-chips{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
         .chip{font-size:12px;color:var(--muted);border:1px solid var(--line);background:var(--panel);padding:6px 10px;border-radius:999px;white-space:nowrap}
-        .chip.warn{color:var(--yellow);border-color:rgba(251,191,36,.35)}
-        .tabs{display:flex;gap:6px;padding:10px 22px 0;border-bottom:1px solid var(--line);background:rgba(7,11,20,.4);position:sticky;top:71px;z-index:19;overflow-x:auto}
+        .chip.warn{color:var(--yellow);border-color:rgba(180,83,9,.28);background:#fff7ed}
+        .tabs{display:flex;gap:6px;padding:10px 22px 0;border-bottom:1px solid var(--line);background:rgba(255,255,255,.55);position:sticky;top:71px;z-index:19;overflow-x:auto}
         .tab{appearance:none;border:1px solid transparent;border-bottom:none;background:transparent;color:var(--muted);padding:10px 16px;border-radius:10px 10px 0 0;cursor:pointer;font:inherit;font-size:14px;white-space:nowrap}
-        .tab:hover{color:var(--text);background:rgba(255,255,255,.03)}
-        .tab.active{color:var(--text);background:var(--panel);border-color:var(--line)}
+        .tab:hover{color:var(--text);background:#eef4ff}
+        .tab.active{color:var(--accent);background:var(--panel);border-color:var(--line);font-weight:600}
         main{padding:22px;max-width:1500px;margin:0 auto}
         .view{display:none}
         .view.active{display:block}
         .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:18px}
         .toolbar input[type=search],.toolbar input[type=text]{flex:1 1 260px;min-width:220px;background:var(--panel);border:1px solid var(--line);color:var(--text);padding:11px 14px;border-radius:10px;font:inherit;outline:none}
-        .toolbar input:focus,.panel input:focus,.panel select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(56,189,248,.15)}
+        .toolbar input:focus,.panel input:focus,.panel select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.14)}
         .custom-package{display:flex;gap:8px;flex:1 1 340px}
         .custom-package input{flex:1}
         .layout{display:grid;grid-template-columns:minmax(0,1fr) 390px;gap:18px;align-items:start}
         .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
         .fw-card{position:relative;background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:var(--radius);padding:16px;cursor:pointer;transition:transform .15s ease,border-color .15s ease,box-shadow .15s ease;outline:none}
-        .fw-card:hover{transform:translateY(-2px);border-color:#3b5b8a;box-shadow:0 12px 30px rgba(0,0,0,.25)}
-        .fw-card:focus-visible{box-shadow:0 0 0 3px rgba(56,189,248,.35)}
-        .fw-card.selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 16px 40px rgba(56,189,248,.12)}
+        .fw-card:hover{transform:translateY(-2px);border-color:#9dbdf0;box-shadow:0 12px 26px rgba(37,99,235,.14)}
+        .fw-card:focus-visible{box-shadow:0 0 0 3px rgba(37,99,235,.3)}
+        .fw-card.selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 16px 34px rgba(37,99,235,.16)}
         .fw-head{display:flex;gap:12px;align-items:center;margin-bottom:10px}
         .monogram{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-weight:800;font-size:15px;color:#fff;background:var(--fw,#64748b);flex:0 0 auto;box-shadow:inset 0 0 0 1px rgba(255,255,255,.15)}
         <?= $colorRules ?>
@@ -4025,35 +3829,35 @@ function renderApp(): void
         .fw-head code{color:var(--muted);font-size:11px}
         .fw-card p{color:var(--muted);font-size:13px;line-height:1.45;margin:0 0 12px;min-height:38px}
         .badges{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
-        .badge{font-size:11px;border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--muted);padding:4px 8px;border-radius:999px;white-space:nowrap}
-        .badge.latest{color:var(--green);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.08)}
-        .badge.warn{color:var(--yellow);border-color:rgba(251,191,36,.35)}
+        .badge{font-size:11px;border:1px solid var(--line);background:#f6faff;color:var(--muted);padding:4px 8px;border-radius:999px;white-space:nowrap}
+        .badge.latest{color:#0b7a45;border-color:rgba(15,157,88,.3);background:#eefaf3}
+        .badge.warn{color:var(--yellow);border-color:rgba(180,83,9,.28);background:#fff7ed}
         .tags{display:flex;gap:6px;flex-wrap:wrap}
-        .tags span{font-size:10px;color:#7dd3fc;background:rgba(56,189,248,.08);border:1px solid rgba(56,189,248,.18);padding:3px 7px;border-radius:6px}
-        .panel{position:sticky;top:132px;background:linear-gradient(180deg,var(--panel),#0d1729);border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:var(--shadow)}
+        .tags span{font-size:10px;color:#1d4ed8;background:#eff5ff;border:1px solid #cfe0fb;padding:3px 7px;border-radius:6px}
+        .panel{position:sticky;top:132px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:var(--shadow)}
         .panel-empty{color:var(--muted);font-size:14px;line-height:1.5;padding:18px 6px;text-align:center}
         .panel h2{font-size:19px;margin:0 0 4px}
         .panel .pkg{color:var(--muted);font-size:12px;margin-bottom:14px}
         .panel label{display:block;font-size:12px;color:var(--muted);margin:12px 0 6px}
-        .panel select,.panel input[type=text]{width:100%;background:#0a1324;border:1px solid var(--line);color:var(--text);padding:10px 12px;border-radius:9px;font:inherit;outline:none}
+        .panel select,.panel input[type=text]{width:100%;background:#f8fbff;border:1px solid var(--line);color:var(--text);padding:10px 12px;border-radius:9px;font:inherit;outline:none}
         .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
         .row + .row{margin-top:8px}
-        .panel .note{font-size:12px;color:var(--yellow);background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.25);padding:8px 10px;border-radius:8px;margin-top:10px;line-height:1.4}
-        .panel .issues{font-size:12px;color:var(--red);background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);padding:8px 10px;border-radius:8px;margin-top:10px;line-height:1.4}
+        .panel .note{font-size:12px;color:var(--yellow);background:#fff8ed;border:1px solid #f7dcb4;padding:8px 10px;border-radius:8px;margin-top:10px;line-height:1.4}
+        .panel .issues{font-size:12px;color:var(--red);background:#fef2f2;border:1px solid #fbd5d5;padding:8px 10px;border-radius:8px;margin-top:10px;line-height:1.4}
         .panel .issues ul{margin:4px 0 0;padding-left:18px}
         .options{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;margin-top:10px}
-        .options label{display:flex;align-items:center;gap:7px;margin:0;font-size:12px;color:var(--text);background:rgba(255,255,255,.02);border:1px solid var(--line);padding:7px 8px;border-radius:8px;cursor:pointer}
+        .options label{display:flex;align-items:center;gap:7px;margin:0;font-size:12px;color:var(--text);background:#f8fbff;border:1px solid var(--line);padding:7px 8px;border-radius:8px;cursor:pointer}
         .options input{accent-color:var(--accent)}
-        .btn{appearance:none;border:1px solid var(--line);background:var(--card2);color:var(--text);padding:10px 14px;border-radius:10px;font:inherit;font-size:14px;cursor:pointer;transition:filter .15s ease,transform .15s ease}
-        .btn:hover{filter:brightness(1.12)}
+        .btn{appearance:none;border:1px solid var(--line);background:var(--card2);color:var(--text);padding:10px 14px;border-radius:10px;font:inherit;font-size:14px;cursor:pointer;transition:filter .15s ease,transform .15s ease,box-shadow .15s ease}
+        .btn:hover{filter:brightness(.98);box-shadow:0 4px 12px rgba(37,99,235,.10)}
         .btn:active{transform:translateY(1px)}
-        .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;color:#04101f;font-weight:700}
+        .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;color:#fff;font-weight:700;box-shadow:0 8px 20px rgba(37,99,235,.25)}
         .btn.ghost{background:transparent}
-        .btn.danger{color:var(--red);border-color:rgba(248,113,113,.35)}
+        .btn.danger{color:var(--red);border-color:#f3c4c4;background:#fff6f6}
         .btn:disabled{opacity:.55;cursor:not-allowed;transform:none}
         .btn.wide{width:100%;margin-top:14px}
         .status{font-size:12px;color:var(--muted);margin-top:10px;min-height:18px}
-        .log{background:#050a12;border:1px solid var(--line);border-radius:10px;padding:12px;color:#cbd5e1;font-size:12px;line-height:1.45;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:10px 0 0}
+        .log{background:#f7faff;border:1px solid var(--line);border-radius:10px;padding:12px;color:#334155;font-size:12px;line-height:1.45;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:10px 0 0}
         .log.small{max-height:260px}
         .section-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:16px}
         .section-head h2{margin:0 0 4px;font-size:20px}
@@ -4061,12 +3865,12 @@ function renderApp(): void
         .projects{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:auto}
         .table{width:100%;border-collapse:collapse;font-size:13px;min-width:760px}
         .table th,.table td{padding:11px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}
-        .table th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:rgba(255,255,255,.02);position:sticky;top:0}
+        .table th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f4f8ff;position:sticky;top:0}
         .table tr:last-child td{border-bottom:none}
-        .table code{color:#bae6fd}
+        .table code{color:#1d4ed8}
         .status-pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:4px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
-        .status-pill.ok{color:var(--green);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.08)}
-        .status-pill.update{color:var(--yellow);border-color:rgba(251,191,36,.35);background:rgba(251,191,36,.08)}
+        .status-pill.ok{color:#0b7a45;border-color:rgba(15,157,88,.3);background:#eefaf3}
+        .status-pill.update{color:var(--yellow);border-color:rgba(180,83,9,.28);background:#fff7ed}
         .status-pill.unknown{color:var(--muted)}
         .empty{padding:40px;text-align:center;color:var(--muted);font-size:14px}
         .checks{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:18px}
@@ -4075,20 +3879,20 @@ function renderApp(): void
         .check .check-head strong{font-size:13px}
         .check p{margin:0;color:var(--muted);font-size:12px;line-height:1.4;word-break:break-word}
         .check .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:0 0 auto}
-        .check.ok .dot{background:var(--green);box-shadow:0 0 10px rgba(52,211,153,.6)}
-        .check.warn .dot{background:var(--yellow);box-shadow:0 0 10px rgba(251,191,36,.6)}
-        .check.fail .dot{background:var(--red);box-shadow:0 0 10px rgba(248,113,113,.6)}
+        .check.ok .dot{background:var(--green);box-shadow:0 0 8px rgba(15,157,88,.5)}
+        .check.warn .dot{background:#f59e0b;box-shadow:0 0 8px rgba(245,158,11,.5)}
+        .check.fail .dot{background:var(--red);box-shadow:0 0 8px rgba(220,38,38,.5)}
         .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
         .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
         .card h3{margin:0 0 12px;font-size:15px}
         .card dl{display:grid;grid-template-columns:auto 1fr;gap:7px 12px;margin:0;font-size:12px}
         .card dt{color:var(--muted)}
         .card dd{margin:0;word-break:break-word}
-        .toast{position:fixed;right:20px;bottom:20px;max-width:min(420px,calc(100vw - 40px));background:#0b1528;border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:12px;padding:12px 14px;box-shadow:var(--shadow);font-size:13px;line-height:1.4;opacity:0;transform:translateY(12px);pointer-events:none;transition:opacity .2s ease,transform .2s ease;z-index:50}
+        .toast{position:fixed;right:20px;bottom:20px;max-width:min(420px,calc(100vw - 40px));background:#ffffff;border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:12px;padding:12px 14px;box-shadow:var(--shadow);font-size:13px;line-height:1.4;opacity:0;transform:translateY(12px);pointer-events:none;transition:opacity .2s ease,transform .2s ease;z-index:50}
         .toast.show{opacity:1;transform:none}
         .toast.error{border-left-color:var(--red)}
         .toast.success{border-left-color:var(--green)}
-        .spinner{width:18px;height:18px;border:2px solid rgba(255,255,255,.2);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;display:inline-block;vertical-align:-3px;margin-right:8px}
+        .spinner{width:18px;height:18px;border:2px solid #dbe7fa;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;display:inline-block;vertical-align:-3px;margin-right:8px}
         @keyframes spin{to{transform:rotate(360deg)}}
         footer.app-footer{max-width:1500px;margin:0 auto;padding:8px 22px 26px;color:var(--muted);font-size:11px;text-align:right}
         @media(max-width:1100px){.layout{grid-template-columns:1fr}.panel{position:static}.grid-2{grid-template-columns:1fr}}
@@ -4101,7 +3905,7 @@ function renderApp(): void
         <span class="logo">PI</span>
         <div>
             <h1>PHP Framework Installer</h1>
-            <p>Установка и проверка версий PHP-фреймворков</p>
+            <p>Выберите фреймворк — подходящую версию подберём автоматически</p>
         </div>
     </div>
     <div class="env-chips">
@@ -4112,7 +3916,6 @@ function renderApp(): void
             <span class="chip warn">HTTP без TLS</span>
         <?php endif; ?>
     </div>
-    <a class="btn ghost" href="?action=logout">Выйти</a>
 </header>
 
 <nav class="tabs" role="tablist" aria-label="Разделы установщика">
@@ -4866,7 +4669,6 @@ window.__INSTALLER__ = <?= jsonForScript($bootstrap) ?>;
                 ['Каталог', env.base_dir],
                 ['Свободно', fmtBytes(env.disk_free)],
                 ['Composer', env.composer?.version || (env.composer?.found ? 'найден' : 'не найден')],
-                ['Ключ', env.key_file],
                 ['Кэш', env.cache_dir],
                 ['Журнал', env.log_file],
                 ['install.lock', env.install_lock ? 'есть' : 'нет']
@@ -5017,21 +4819,15 @@ function handleWeb(): void
             return;
         }
 
-        $action = (string) ($_GET['action'] ?? $_POST['action'] ?? '');
-        if ($action === 'logout') {
-            handleLogout();
-            return;
-        }
-        if ($action === 'login') {
-            handleLogin();
+        if (!webAccessAllowed()) {
+            installerLog('web access denied', ['ip' => requestIp()]);
+            http_response_code(403);
+            renderRemoteBlocked();
             return;
         }
 
         $api = (string) ($_GET['api'] ?? '');
         if ($api !== '') {
-            if (!isAuthenticated()) {
-                jsonOut(['ok' => false, 'error' => 'Требуется авторизация.'], 401);
-            }
             switch ($api) {
                 case 'registry':
                     apiRegistry();
@@ -5062,21 +4858,10 @@ function handleWeb(): void
             }
         }
 
-        if (!isAuthenticated()) {
-            try {
-                ensureKey();
-            } catch (Throwable $e) {
-                renderLogin('', $e->getMessage());
-                return;
-            }
-            renderLogin();
-            return;
-        }
-
         renderApp();
     } catch (InstallerException $e) {
         $code = (int) $e->getCode();
-        if (!in_array($code, [401, 403, 429], true)) {
+        if (!in_array($code, [400, 403, 405, 429], true)) {
             $code = 500;
         }
         installerLog('web error', ['error' => $e->getMessage(), 'code' => $code]);
@@ -5091,7 +4876,7 @@ function handleWeb(): void
             header('Content-Type: text/html; charset=utf-8');
         }
         echo '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Ошибка</title>'
-            . '<body style="font-family:system-ui,sans-serif;background:#070b14;color:#e8eefc;padding:2rem">'
+            . '<body style="font-family:system-ui,sans-serif;background:#eef5ff;color:#12233d;padding:2rem">'
             . '<h1>Ошибка</h1><p>' . e($e->getMessage()) . '</p></body></html>';
     } catch (Throwable $e) {
         installerLog('web fatal', [
